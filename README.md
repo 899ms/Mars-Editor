@@ -41,4 +41,17 @@ npm install
 npm run dev      # 开发服务器
 npm run build    # 类型检查 + 生产构建
 npm run preview  # 预览构建产物
+npm run deploy   # 构建并发到 Cloudflare Pages（mars-editor.pages.dev）
 ```
+
+## 发版
+
+线上是 Cloudflare Pages 项目 `mars-editor`，**直传部署，没有接 GitHub 自动构建** ——
+推代码到 main 不会更新线上，必须跑一次：
+
+```bash
+npm run deploy
+```
+
+发完可以用 `npx wrangler pages deployment list --project-name mars-editor` 核对，
+最新一条的 Source 应当是刚推上去的 commit。
