@@ -938,11 +938,15 @@ export function applyDensity(th: Theme, d: DensityScale): Theme {
   };
 }
 
-/** 密度档位（基数为各主题默认 16px） */
+/**
+ * 排版密度档位。
+ * 「标准」是恒等变换 —— 各主题自己调好的字号/行高/间距就是设计基准，
+ * 紧凑与宽松只在它两侧偏移，这样切主题不会因为密度默认值而走样。
+ */
 export const DENSITIES: { id: string; name: string; scale: DensityScale }[] = [
-  { id: 'compact', name: '紧凑', scale: { font: 0.88, line: 0.93, margin: 0.75 } },
-  { id: 'standard', name: '标准', scale: { font: 0.94, line: 0.97, margin: 0.9 } },
-  { id: 'roomy', name: '宽松', scale: { font: 1, line: 1, margin: 1 } },
+  { id: 'compact', name: '紧凑', scale: { font: 0.92, line: 0.94, margin: 0.78 } },
+  { id: 'standard', name: '标准', scale: { font: 1, line: 1, margin: 1 } },
+  { id: 'roomy', name: '宽松', scale: { font: 1.08, line: 1.06, margin: 1.22 } },
 ];
 
 export function getDensity(id?: string): DensityScale {

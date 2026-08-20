@@ -12,14 +12,17 @@ import {
   renderArticle,
 } from './markdown';
 import { copyRichText } from './clipboard';
+import { downloadBlob, exportBackupZip, exportDraftMarkdown, importFiles, safeFileName } from './exchange';
+import { renderLongImage } from './longimage';
 import { SAMPLE_MARKDOWN } from './sample';
-import { getTheme } from './theme';
+import { getDensity, getTheme } from './theme';
 import { deleteImage, getAllImages, putImage } from './imagedb';
 import { createScrollSyncChannel } from './scrollSync';
 import './styles.css';
 
 const STORAGE_KEY = 'wechat-mp-editor:md';
 const STORAGE_THEME = 'wechat-mp-editor:theme';
+const STORAGE_DENSITY = 'wechat-mp-editor:density';
 const STORAGE_DRAFTS = 'wechat-mp-editor:drafts';
 const STORAGE_ACTIVE_DRAFT = 'wechat-mp-editor:active-draft';
 /** 旧版图片注册表存放位置（localStorage），仅用于一次性迁移 */
@@ -109,7 +112,10 @@ export default function App() {
   // 图片注册表存 IndexedDB（容量大），挂载后异步加载到内存供同步渲染
   const [images, setImages] = useState<Record<string, string>>({});
   const [themeId, setThemeId] = useState<string>(() => localStorage.getItem(STORAGE_THEME) ?? 'classic');
+  const [densityId, setDensityId] = useState<string>(() => localStorage.getItem(STORAGE_DENSITY) ?? 'standard');
   const [status, setStatus] = useState<string | null>(null);
+  /** 导出进行中（长图 / 备份包都要跑一会儿） */
+  const [exporting, setExporting] = useState(false);
   /** 对照 / 预览模式 */
   const [viewMode, setViewMode] = useState<'split' | 'preview'>('split');
   /** 编辑器侧宽度（百分比，默认预览最小宽度） */
@@ -123,15 +129,16 @@ export default function App() {
   const editorRef = useRef<HTMLElement>(null);
 
   const theme = useMemo(() => getTheme(themeId), [themeId]);
+  const density = useMemo(() => getDensity(densityId), [densityId]);
   /** 高亮器就绪后翻转一次，触发补高亮的重渲染 */
   const [hlReady, setHlReady] = useState(isHighlighterReady);
   // 整篇重渲染让给输入：打字时先用上一版预览，空闲时再补算新版
   const deferredMarkdown = useDeferredValue(markdown);
   const result = useMemo(
-    () => renderArticle(deferredMarkdown, theme, images),
+    () => renderArticle(deferredMarkdown, theme, images, density),
     // hlReady 只作为「重算一次」的信号，不参与渲染入参
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [deferredMarkdown, theme, images, hlReady],
+    [deferredMarkdown, theme, images, density, hlReady],
   );
 
   // highlight.js 懒加载（不阻塞首屏），就绪后补上代码高亮
@@ -198,10 +205,13 @@ export default function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [drafts]);
 
-  // 记住主题
+  // 记住主题与密度
   useEffect(() => {
     localStorage.setItem(STORAGE_THEME, theme.id);
   }, [theme.id]);
+  useEffect(() => {
+    localStorage.setItem(STORAGE_DENSITY, densityId);
+  }, [densityId]);
 
   /** 安全保存草稿列表，返回是否成功 */
   const saveDraftsSafe = (): boolean => {
@@ -326,9 +336,77 @@ export default function App() {
   const handleCopy = async () => {
     // 预览走的是延迟值、且高亮可能还没加载完，导出必须按当前正文重新渲染一次
     await ensureHighlighter();
-    const { html } = renderArticle(markdown, theme, images);
+    const { html } = renderArticle(markdown, theme, images, density);
     const ok = await copyRichText(html);
     flash(ok ? '已复制，去公众号 ⌘V 粘贴' : '复制失败，请用浏览器 Chrome/Edge');
+  };
+
+  /* ---------------- 导入 / 导出 ---------------- */
+
+  /** 导入 .md / .zip：草稿追加到列表末尾并跳过去，图片并入图片库 */
+  const handleImport = async (files: File[]) => {
+    try {
+      const { drafts: incoming, images: incomingImages, skipped } = await importFiles(files);
+      const imageCount = Object.keys(incomingImages).length;
+      if (!incoming.length && !imageCount) {
+        flash(skipped.length ? '没有可导入的 Markdown 或备份文件' : '文件是空的');
+        return;
+      }
+      if (incoming.length) {
+        setDrafts((prev) => [...prev, ...incoming]);
+        setActiveDraft(incoming[0].id);
+      }
+      if (imageCount) {
+        setImages((prev) => ({ ...prev, ...incomingImages }));
+        // 写盘失败不该拦住已经进内存的内容，只提示
+        await Promise.all(Object.entries(incomingImages).map(([n, url]) => putImage(n, url))).catch(() =>
+          flash('部分图片写入本地库失败'),
+        );
+      }
+      const parts = [incoming.length ? `${incoming.length} 篇草稿` : '', imageCount ? `${imageCount} 张图片` : ''];
+      flash(`已导入 ${parts.filter(Boolean).join(' · ')}${skipped.length ? `（跳过 ${skipped.length} 个文件）` : ''}`);
+    } catch (err) {
+      console.warn('导入失败', err);
+      flash('导入失败，文件可能已损坏');
+    }
+  };
+
+  /** 导出当前草稿为 .md */
+  const handleExportMarkdown = () => {
+    if (!activeDraft) return;
+    exportDraftMarkdown(activeDraft);
+    flash(`已导出「${activeDraft.name}.md」`);
+  };
+
+  /** 导出全部草稿 + 图片为 zip 备份 */
+  const handleExportBackup = async () => {
+    setExporting(true);
+    try {
+      await exportBackupZip(drafts, images);
+      flash(`已导出备份（${drafts.length} 篇草稿 · ${Object.keys(images).length} 张图片）`);
+    } catch (err) {
+      console.warn('备份失败', err);
+      flash('备份导出失败');
+    } finally {
+      setExporting(false);
+    }
+  };
+
+  /** 导出正文长图 PNG（按当前正文重新渲染，不用延迟预览值） */
+  const handleExportImage = async () => {
+    setExporting(true);
+    try {
+      await ensureHighlighter();
+      const { body } = renderArticle(markdown, theme, images, density);
+      const blob = await renderLongImage({ body, theme, author: '火星' });
+      downloadBlob(`${safeFileName(activeDraft?.name ?? '长图')}.png`, blob);
+      flash('长图已导出');
+    } catch (err) {
+      console.warn('长图导出失败', err);
+      flash(err instanceof Error ? err.message : '长图导出失败');
+    } finally {
+      setExporting(false);
+    }
   };
 
   /** 拖拽分割条：同步更新编辑器 DOM 宽度（跟手），mouseup 时落回 state */
@@ -413,9 +491,19 @@ export default function App() {
         onViewMode={setViewMode}
         status={status}
         onCopy={handleCopy}
+        onImport={(files) => void handleImport(files)}
+        onExportMarkdown={handleExportMarkdown}
+        onExportBackup={() => void handleExportBackup()}
+        onExportImage={() => void handleExportImage()}
+        exporting={exporting}
       />
       <main className={`workspace ${isPreviewOnly ? 'mode-preview' : ''}`}>
-        <ThemeRail themeId={themeId} onThemeChange={setThemeId} />
+        <ThemeRail
+          themeId={themeId}
+          onThemeChange={setThemeId}
+          densityId={densityId}
+          onDensityChange={setDensityId}
+        />
         <FileTree
           drafts={drafts}
           activeId={activeId}

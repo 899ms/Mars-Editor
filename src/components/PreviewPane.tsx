@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { BatteryFull, CellSignalFull, WifiHigh } from '@phosphor-icons/react';
+import { extractTitle, stripFirstH1 } from '../markdown';
 import type { ScrollSyncChannel } from '../scrollSync';
 import type { Theme } from '../theme';
 
@@ -15,25 +16,6 @@ interface Props {
   resizeKey: string;
   /** 滚动同步通道（编辑器发布位置，这里订阅并写 DOM） */
   sync: ScrollSyncChannel;
-}
-
-/** 从正文 HTML 提取第一个一级标题作为文章标题 */
-function extractTitle(body: string): string {
-  const m = body.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i);
-  if (!m) return '';
-  return m[1]
-    .replace(/<[^>]+>/g, '')
-    .replace(/&amp;/g, '&')
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&#39;/g, "'")
-    .trim();
-}
-
-/** 预览时移除正文中的第一个 h1（文章头已展示标题，避免重复；导出不受影响） */
-function stripFirstH1(body: string): string {
-  return body.replace(/<h1[^>]*>[\s\S]*?<\/h1>/i, '');
 }
 
 interface Anchor {

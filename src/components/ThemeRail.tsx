@@ -1,8 +1,11 @@
-import { darkThemes, lightThemes, type Theme } from '../theme';
+import { DENSITIES, darkThemes, lightThemes, type Theme } from '../theme';
 
 interface Props {
   themeId: string;
   onThemeChange: (id: string) => void;
+  /** 排版密度档位 id（见 theme.ts 的 DENSITIES） */
+  densityId: string;
+  onDensityChange: (id: string) => void;
 }
 
 /**
@@ -14,7 +17,7 @@ interface Props {
  * 浅色与深色分区展示：深色卡片视觉重量大，混在浅色里会显得突兀，
  * 单独归到「深色」小节、排在浅色之后（默认要往下滚才看得到）。
  */
-export default function ThemeRail({ themeId, onThemeChange }: Props) {
+export default function ThemeRail({ themeId, onThemeChange, densityId, onDensityChange }: Props) {
   const renderCard = (th: Theme) => {
     const active = th.id === themeId;
     return (
@@ -50,6 +53,24 @@ export default function ThemeRail({ themeId, onThemeChange }: Props) {
         <div className="rail-section">
           <div className="rail-section-label">深色</div>
           {darkThemes.map(renderCard)}
+        </div>
+      </div>
+
+      {/* 密度：同一套主题下的字号 / 行距 / 段距整体缩放，「标准」即主题原设计值 */}
+      <div className="rail-foot">
+        <div className="rail-section-label">密度</div>
+        <div className="density-group" role="radiogroup" aria-label="排版密度">
+          {DENSITIES.map((d) => (
+            <button
+              key={d.id}
+              role="radio"
+              aria-checked={densityId === d.id}
+              className={`density-btn ${densityId === d.id ? 'active' : ''}`}
+              onClick={() => onDensityChange(d.id)}
+            >
+              {d.name}
+            </button>
+          ))}
         </div>
       </div>
     </nav>
