@@ -7,14 +7,15 @@ import type { Theme } from '../theme';
 interface Props {
   body: string;
   theme: Theme;
-  /** 正文是否包含图片（显示微信粘贴提示） */
+  /** Whether the body contains images (shows the WeChat paste notice) */
   hasImage: boolean;
   /**
-   * 布局变化信号（编辑器宽度 / 模式切换都会改变其值）：
-   * ResizeObserver 的兜底 —— 拖拽分割、切换对照/预览时强制刷新手机/桌面模式判断
+   * Layout-change signal (editor width and mode switching both change it):
+   * a backstop for the ResizeObserver — dragging the splitter or switching
+   * between side-by-side and preview forces the stage to be re-measured.
    */
   resizeKey: string;
-  /** 滚动同步通道（编辑器发布位置，这里订阅并写 DOM） */
+  /** Scroll-sync channel (the editor publishes, this subscribes and writes DOM) */
   sync: ScrollSyncChannel;
 }
 
@@ -23,18 +24,83 @@ interface Anchor {
   top: number;
 }
 
-/** 尾段混合区间：编辑器最后这部分行程用来平滑收敛到预览底部 */
+/** Tail blend range: the last stretch of editor travel used to converge
+ *  smoothly onto the bottom of the preview */
 const TAIL_BLEND = 0.18;
 
 /**
- * 把源码位置换算成预览的滚动偏移。
+ * What the preview is drawn as — always exactly what was picked, whatever the
+ * pane's width:
+ * - iphone: the phone frame
+ * - duo: iPhone Duo lying open, outside up, as in Apple's photos — back half
+ *   on the left, outer screen (the article) on the right
+ * - duo-open: the Duo's inner screen, held landscape
+ * - desktop: a macOS window, for judging the wide measure
+ */
+type PreviewDevice = 'iphone' | 'duo' | 'duo-open' | 'desktop';
+type DuoView = 'duo' | 'duo-open';
+
+const DEVICES: { id: PreviewDevice; name: string; hint: string }[] = [
+  { id: 'iphone', name: 'iPhone', hint: 'iPhone 竖屏' },
+  {
+    id: 'duo',
+    name: 'Duo 外屏',
+    hint: 'iPhone Duo 摊开、外侧朝上：左边背壳，右边外屏（466×678pt）。面板窄时整台缩小，切到「预览」模式看得更清楚',
+  },
+  {
+    id: 'duo-open',
+    name: 'Duo 内屏',
+    hint: 'iPhone Duo 展开、内屏横握（890×626pt）。面板窄时整台缩小，切到「预览」模式看得更清楚',
+  },
+  { id: 'desktop', name: '桌面', hint: '桌面版式：macOS 窗口里的宽排版' },
+];
+
+/** Per browser, like the theme choice: it is how you like to look, not part of the draft */
+const STORAGE_DEVICE = 'wechat-mp-editor:preview-device';
+
+function readDevice(): PreviewDevice {
+  const v = localStorage.getItem(STORAGE_DEVICE);
+  return DEVICES.find((d) => d.id === v)?.id ?? 'iphone';
+}
+
+/** Unzoomed frame sizes of the two Duo views; keep in step with the
+ *  [data-device^='duo'] .phone-frame rules in styles.css */
+const DUO_FRAMES: Record<DuoView, { width: number; height: number }> = {
+  duo: { width: 897, height: 647 },
+  'duo-open': { width: 842, height: 599 },
+};
+
+/** The stage's content box, which the Duo views fit into */
+function measure(stage: HTMLElement | null) {
+  let w = 0;
+  let h = 0;
+  if (stage) {
+    const cs = getComputedStyle(stage);
+    // Floored so sub-pixel jitter while dragging doesn't re-render every frame
+    w = Math.floor(stage.clientWidth - parseFloat(cs.paddingLeft) - parseFloat(cs.paddingRight));
+    h = Math.floor(stage.clientHeight - parseFloat(cs.paddingTop) - parseFloat(cs.paddingBottom));
+  }
+  return { w, h };
+}
+
+/** Zoom that fits a Duo view into the stage, keeping its real proportions (1 = real size) */
+function fitFor(device: PreviewDevice, w: number, h: number): number {
+  if ((device !== 'duo' && device !== 'duo-open') || w <= 0 || h <= 0) return 1;
+  const f = DUO_FRAMES[device];
+  return Math.max(0.3, Math.round(Math.min(1, w / f.width, h / f.height) * 1000) / 1000);
+}
+
+/**
+ * Convert a source position into a preview scroll offset.
  *
- * 关键在于「插值」而不是「吸附」：找到位置所处的两个锚点，按行号比例在它们的
- * 偏移之间线性取值。吸附到最近锚点会让预览一段一段地跳（就是之前那种顿感），
- * 插值后预览是连续跟着编辑器走的。
+ * The point is interpolation, not snapping: find the two anchors the position
+ * falls between and take a linear value between their offsets, in proportion to
+ * the line number. Snapping to the nearest anchor makes the preview jump a
+ * paragraph at a time — that was the old stutter. Interpolated, the preview
+ * follows the editor continuously.
  */
 function offsetForPosition(anchors: Anchor[], position: number, end: Anchor | null): number {
-  // 二分找最后一个 line <= position 的锚点
+  // Binary search for the last anchor with line <= position
   let lo = 0;
   let hi = anchors.length - 1;
   let i = -1;
@@ -48,14 +114,17 @@ function offsetForPosition(anchors: Anchor[], position: number, end: Anchor | nu
     }
   }
   if (i < 0) {
-    // 位置落在首个锚点之上（预览会去掉重复的 h1，开头几行没有对应锚点）：
-    // 从「内容顶部」虚拟插值到首个锚点，否则进入首锚点时会突然跳一大段
+    // The position sits above the first anchor (the preview drops the duplicate
+    // h1, so the opening lines have no anchor of their own): interpolate from a
+    // virtual "top of content" to the first anchor, otherwise reaching it jumps
+    // a long way at once
     const first = anchors[0];
     if (first.line <= 0) return 0;
     return Math.max(0, first.top * Math.min(1, Math.max(0, position / first.line)));
   }
   const cur = anchors[i];
-  // 末尾锚点之后接上「文末」虚拟锚点，尾段照样连续插值，不再冻结后硬跳
+  // Past the last anchor, attach a virtual "end of article" anchor so the tail
+  // keeps interpolating instead of freezing and then jumping
   const next = anchors[i + 1] ?? (end && end.line > cur.line ? end : null);
   if (!next) return Math.max(0, cur.top);
   const span = next.line - cur.line;
@@ -65,72 +134,94 @@ function offsetForPosition(anchors: Anchor[], position: number, end: Anchor | nu
 }
 
 /**
- * 建立「源码行号 → 预览内容偏移」锚点表。
- * top 是相对滚动内容顶部的偏移（不含当前 scrollTop），因此滚动时可以直接复用，
- * 只在正文或布局变化后才需要重建。
+ * Build the "source line → preview offset" anchor table.
+ * `top` is relative to the top of the scrolled content (it excludes the current
+ * scrollTop), so it can be reused while scrolling and only needs rebuilding
+ * after the body or the layout changes.
  */
 function buildAnchors(scroll: HTMLElement): Anchor[] {
-  // 一次性读完所有几何量，中间不写 DOM，浏览器只需强制一次重排
-  const base = scroll.getBoundingClientRect().top - scroll.scrollTop;
+  // Read every geometry value in one pass without writing DOM in between, so
+  // the browser is forced through a single reflow
+  const box = scroll.getBoundingClientRect();
+  // Rects are in visual pixels, scrollTop in the scroller's own layout pixels.
+  // They differ by every zoom above the scroller (0.92 on the phone screen,
+  // times the fit-to-pane zoom of the Duo views), and engines disagree on
+  // whether rects include zoom at all — so measure the ratio, don't assume it.
+  const k = scroll.offsetHeight > 0 ? box.height / scroll.offsetHeight : 1;
   const anchors: Anchor[] = [];
   for (const el of scroll.querySelectorAll<HTMLElement>('[data-line]')) {
     const line = Number(el.dataset.line);
     if (anchors.length && anchors[anchors.length - 1].line === line) continue;
-    anchors.push({ line, top: el.getBoundingClientRect().top - base });
+    anchors.push({ line, top: (el.getBoundingClientRect().top - box.top) / k + scroll.scrollTop });
   }
   return anchors;
 }
 
 /**
- * 右侧预览：
- * - 窄面板（<860px）→ 手机样式（设备框 + 灵动岛状态栏）
- * - 宽面板（≥860px）→ 桌面 Mac 窗口样式（交通灯标题栏）
- * - 顶部文章头（标题 + 作者行），底部操作栏（分享/收藏/在看/点赞，内容末尾）
- * 正文 HTML 样式全部内联 ⇒ 预览与导出（微信粘贴）完全一致。
+ * The right-hand preview, drawn as the chosen device (see PreviewDevice):
+ * - the Duo views keep their real proportions and zoom to fit the pane
+ * - desktop is a macOS window with a traffic-light title bar
+ * - article head on top (title plus byline), action bar at the end of the content
+ * Every style in the body HTML is inline ⇒ preview and export (the WeChat
+ * paste) are identical.
  */
 export default function PreviewPane({ body, theme, hasImage, resizeKey, sync }: Props) {
   const paneRef = useRef<HTMLElement>(null);
+  const stageRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const bodyRef = useRef<HTMLDivElement>(null);
-  const [widthMode, setWidthMode] = useState<'phone' | 'desktop'>('phone');
+  /** Content box of the device stage, for fitting the Duo views */
+  const [stage, setStage] = useState({ w: 0, h: 0 });
+  const [device, setDeviceState] = useState<PreviewDevice>(readDevice);
+  const setDevice = (next: PreviewDevice) => {
+    localStorage.setItem(STORAGE_DEVICE, next);
+    setDeviceState(next);
+  };
+  /** What actually gets drawn */
+  const layout = device === 'desktop' ? 'desktop' : 'phone';
+  const fit = fitFor(device, stage.w, stage.h);
   const title = useMemo(() => extractTitle(body), [body]);
-  /** 预览用正文（去掉重复的 h1；仅预览，导出仍用完整 body） */
+  /** Body used for the preview (duplicate h1 removed; exports still use the full body) */
   const previewBody = useMemo(() => (title ? stripFirstH1(body) : body), [body, title]);
-  /** 文章头日期（每次渲染 new Date() 没有意义） */
+  /** Date in the article head (a new Date() on every render means nothing) */
   const today = useMemo(() => new Date(), []);
 
-  // 面板宽度变化时自动切换手机 / 桌面模式
+  // Track the stage size as the pane resizes, for fitting the Duo views
   useEffect(() => {
-    const el = paneRef.current;
-    if (!el) return;
-    const update = () => setWidthMode(el.getBoundingClientRect().width >= 860 ? 'desktop' : 'phone');
+    const pane = paneRef.current;
+    if (!pane) return;
+    const update = () => {
+      const m = measure(stageRef.current);
+      setStage((prev) => (prev.w === m.w && prev.h === m.h ? prev : m));
+    };
     update();
     const ro = new ResizeObserver(update);
-    ro.observe(el);
+    ro.observe(pane);
     return () => ro.disconnect();
   }, []);
 
-  // 布局变化（拖拽 / 模式切换）兜底刷新
+  // Backstop refresh on a layout change (drag, mode switch)
   useEffect(() => {
-    const el = paneRef.current;
-    if (!el) return;
-    setWidthMode(el.getBoundingClientRect().width >= 860 ? 'desktop' : 'phone');
+    const m = measure(stageRef.current);
+    setStage((prev) => (prev.w === m.w && prev.h === m.h ? prev : m));
   }, [resizeKey]);
 
-  /** 锚点缓存（null 表示需要重建） */
+  /** Anchor cache (null means it needs rebuilding) */
   const anchorsRef = useRef<Anchor[] | null>(null);
-  /** 请求一次同步（rAF 合帧）；供正文变化等场景复用 */
+  /** Request one sync (coalesced onto a rAF); reused when the body changes */
   const scheduleRef = useRef<() => void>(() => {});
 
-  // 编辑器滚动 → 预览滚动同步。整条链路不经过 React：
-  // 订阅通道 → rAF 合帧 → 读锚点插值 → 写 scrollTop。
+  // Editor scroll → preview scroll. None of this path goes through React:
+  // subscribe to the channel → coalesce onto a frame → interpolate the anchors
+  // → write scrollTop.
   useEffect(() => {
     const apply = () => {
       const scroll = scrollRef.current;
       if (!scroll) return;
       const { position, endPosition, atTop, atBottom } = sync.state;
-      // 边界精确对齐，避免插值误差在首尾留下缝隙。
-      // 到底时的吸附现在是「插值本来就已经收敛到底部」，不再是一次跳跃。
+      // Align the edges exactly, so interpolation error leaves no gap at either
+      // end. Snapping at the bottom is now "the interpolation had already
+      // converged there", not a jump.
       if (atBottom) {
         scroll.scrollTop = scroll.scrollHeight;
         return;
@@ -149,14 +240,16 @@ export default function PreviewPane({ body, theme, hasImage, resizeKey, sync }: 
       const end = endPosition > 0 ? { line: endPosition, top: maxScroll } : null;
       let top = offsetForPosition(anchors, position, end);
 
-      // 收尾对齐：编辑器滚到底时，顶部可见行其实还在文档中段，
-      // 按锚点算出来的位置离预览底部还差一截 —— 以前靠「到底就跳到底」补上这一截，
-      // 于是临近结尾会突然蹦一下。改成在最后一段行程里平滑收敛到底部。
+      // Landing alignment: when the editor hits its bottom, the topmost visible
+      // line is still mid-document, and the anchor-derived position falls short
+      // of the preview's bottom. That gap used to be closed by "at the bottom,
+      // jump to the bottom", which is why the ending lurched. Now it converges
+      // over the final stretch instead.
       if (endPosition > 0) {
         const t = Math.min(1, Math.max(0, position / endPosition));
         if (t > 1 - TAIL_BLEND) {
           const w = (t - (1 - TAIL_BLEND)) / TAIL_BLEND;
-          const eased = w * w * (3 - 2 * w); // smoothstep，进入混合区时不出现折角
+          const eased = w * w * (3 - 2 * w); // smoothstep: no kink on entering the blend
           top = top + (maxScroll - top) * eased;
         }
       }
@@ -166,7 +259,7 @@ export default function PreviewPane({ body, theme, hasImage, resizeKey, sync }: 
 
     let raf = 0;
     const schedule = () => {
-      // 一帧内的多次滚动事件合并成一次读写
+      // Collapse several scroll events in one frame into a single read/write
       if (raf) return;
       raf = requestAnimationFrame(() => {
         raf = 0;
@@ -182,13 +275,14 @@ export default function PreviewPane({ body, theme, hasImage, resizeKey, sync }: 
     };
   }, [sync]);
 
-  // 正文重渲染 / 手机⇄桌面切换后，锚点偏移全部作废，并重新对齐一次
+  // A re-rendered body, a device switch or a refit invalidates every anchor
+  // offset, and calls for one realignment
   useEffect(() => {
     anchorsRef.current = null;
     scheduleRef.current();
-  }, [body, widthMode]);
+  }, [body, device, fit]);
 
-  // 图片解码、字体加载这类异步高度变化同样让锚点作废
+  // Async height changes — image decoding, font loading — invalidate them too
   useEffect(() => {
     const el = bodyRef.current;
     if (!el) return;
@@ -200,7 +294,7 @@ export default function PreviewPane({ body, theme, hasImage, resizeKey, sync }: 
     return () => ro.disconnect();
   }, []);
 
-  // 主题变化时联动状态栏 / 桌面窗口配色
+  // Follow the article theme in the status bar and desktop window chrome
   useEffect(() => {
     document.documentElement.style.setProperty('--art-accent', theme.accent);
     document.documentElement.style.setProperty('--art-heading', theme.heading.color);
@@ -221,33 +315,81 @@ export default function PreviewPane({ body, theme, hasImage, resizeKey, sync }: 
   }, [theme]);
 
   return (
-    <section className="split-pane preview-side" ref={paneRef} data-width={widthMode}>
+    <section
+      className="split-pane preview-side"
+      ref={paneRef}
+      data-width={layout}
+      data-device={device}
+      // The web build has no shell dark mode: the paper decides, so a dark
+      // theme gets the Night Sky Duo and a light one Star White
+      data-appearance={theme.appearance}
+    >
       <div className="pane-head">
-        <span className="pane-title">
-          预览
-        </span>
-        {hasImage && (
-          <div className="pane-head-right">
-            <span className="pane-stat warn">含图片 · 建议公众号内单独上传</span>
+        <span className="pane-title">预览</span>
+        <div className="pane-head-right">
+          {hasImage && <span className="pane-stat warn">含图片 · 建议公众号内单独上传</span>}
+          <div className="segmented device-switch" role="radiogroup" aria-label="预览机型">
+            {DEVICES.map((d) => (
+              <button
+                key={d.id}
+                role="radio"
+                aria-checked={device === d.id}
+                className={`seg-btn ${device === d.id ? 'active' : ''}`}
+                title={d.hint}
+                onClick={() => setDevice(d.id)}
+              >
+                {d.name}
+              </button>
+            ))}
           </div>
-        )}
+        </div>
       </div>
-      <div className="phone-stage">
-        <div className="phone-frame">
-          {/* iPhone 侧键（手机模式显示）：左静音 + 左音量上下，右电源 */}
+      <div className="phone-stage" ref={stageRef}>
+        <div className="phone-frame" style={device === 'duo' || device === 'duo-open' ? { zoom: fit } : undefined}>
+          {/* Side buttons (phone mode): on the iPhone, action and volume left,
+              power right; the Duo views move them to where its edges carry them */}
           <span className="side-btn action" aria-hidden="true"></span>
           <span className="side-btn vol-up" aria-hidden="true"></span>
           <span className="side-btn vol-down" aria-hidden="true"></span>
           <span className="side-btn power" aria-hidden="true"></span>
+          {/* iPhone Duo's back half, lying beside the outer screen */}
+          {device === 'duo' && (
+            <div className="duo-back" aria-hidden="true">
+              <div className="duo-plateau">
+                <span className="duo-lens l1"></span>
+                <span className="duo-lens l2"></span>
+                <span className="duo-mic"></span>
+                <span className="duo-flash"></span>
+              </div>
+              {/* The Apple mark — the true outline, from Simple Icons (CC0) —
+                  in one quiet tone with a faint diagonal sheen */}
+              <svg className="duo-logo" viewBox="0 0 24 24" width="112" height="112" aria-hidden="true">
+                <defs>
+                  <linearGradient id="duo-logo-sheen" x1="0" y1="0" x2="1" y2="1">
+                    <stop className="a" offset="0" />
+                    <stop className="sheen" offset="0.46" />
+                    <stop className="a" offset="0.54" />
+                    <stop className="b" offset="1" />
+                  </linearGradient>
+                </defs>
+                <path
+                  fill="url(#duo-logo-sheen)"
+                  d="M12.152 6.896c-.948 0-2.415-1.078-3.96-1.04-2.04.027-3.91 1.183-4.961 3.014-2.117 3.675-.546 9.103 1.519 12.09 1.013 1.454 2.208 3.09 3.792 3.039 1.52-.065 2.09-.987 3.935-.987 1.831 0 2.35.987 3.96.948 1.637-.026 2.676-1.48 3.676-2.948 1.156-1.688 1.636-3.325 1.662-3.415-.039-.013-3.182-1.221-3.22-4.857-.026-3.04 2.48-4.494 2.597-4.559-1.429-2.09-3.623-2.324-4.39-2.376-2-.156-3.675 1.09-4.61 1.09zM15.53 3.83c.843-1.012 1.4-2.427 1.245-3.83-1.207.052-2.662.805-3.532 1.818-.78.896-1.454 2.338-1.273 3.714 1.338.104 2.715-.688 3.559-1.701"
+                />
+              </svg>
+            </div>
+          )}
           <div className="phone-screen">
-            {/* Mac 窗口标题栏（桌面模式显示） */}
+            {/* macOS window title bar (desktop mode) */}
             <div className="desktop-bar">
               <span className="traffic t1"></span>
               <span className="traffic t2"></span>
               <span className="traffic t3"></span>
               <span className="bar-title">文章预览 · {theme.name}</span>
             </div>
-            {/* 手机状态栏：灵动岛居中，两侧真实状态图标 */}
+            {/* Phone status bar: Dynamic Island centered, real status icons on
+                either side. The Duo has no bar: the time and one status ring
+                (Wi-Fi inside, signal as dots) stack in the top-right corner. */}
             <div className="statusbar">
               <span className="time">9:41</span>
               <span className="dynamic-island" aria-hidden="true"></span>
@@ -256,9 +398,25 @@ export default function PreviewPane({ body, theme, hasImage, resizeKey, sync }: 
                 <WifiHigh size={13} weight="bold" />
                 <BatteryFull size={17} weight="fill" />
               </span>
+              <svg className="sb-orb" viewBox="0 0 32 32" aria-hidden="true">
+                {/* Circle outline over the top and down both sides, to just below the middle */}
+                <path className="ring" d="M1.99 19.75A14.5 14.5 0 1 1 30.01 19.75" />
+                <g className="wifi">
+                  <path d="M13.6 16.1A3.4 3.4 0 0 1 18.4 16.1" />
+                  <path d="M11.19 13.69A6.8 6.8 0 0 1 20.81 13.69" />
+                  <path d="M8.79 11.29A10.2 10.2 0 0 1 23.21 11.29" />
+                </g>
+                <circle cx="16" cy="18.5" r="1.4" />
+                {/* The bottom of the circle, finished in five dots */}
+                <circle cx="27.11" cy="25.32" r="1.15" />
+                <circle cx="22.13" cy="29.14" r="1.15" />
+                <circle cx="16" cy="30.5" r="1.15" />
+                <circle cx="9.87" cy="29.14" r="1.15" />
+                <circle cx="4.89" cy="25.32" r="1.15" />
+              </svg>
             </div>
             <div className="article-scroll" ref={scrollRef}>
-              {/* 公众号文章头：标题（无标题时占位）+ 作者行 */}
+              {/* WeChat article head: title (with a placeholder when empty) plus byline */}
               <div className="article-head">
                 <h1 className="head-title">{title || '未命名文章'}</h1>
                 <div className="meta">
@@ -273,7 +431,7 @@ export default function PreviewPane({ body, theme, hasImage, resizeKey, sync }: 
                 ref={bodyRef}
                 dangerouslySetInnerHTML={{ __html: previewBody }}
               />
-              {/* 文章底栏：分享 / 收藏 / 在看 / 点赞（内容末尾） */}
+              {/* Article footer: share / save / recommend / like, at the end of the content */}
               <div className="article-footer">
                 <div className="actions">
                   <button className="action">分享</button>
@@ -283,7 +441,9 @@ export default function PreviewPane({ body, theme, hasImage, resizeKey, sync }: 
                 </div>
               </div>
             </div>
-            {/* 底部 home indicator（手机模式） */}
+            {/* The fold down the middle of the Duo's inner screen */}
+            <span className="crease" aria-hidden="true"></span>
+            {/* Home indicator (phone mode) */}
             <span className="home-indicator" aria-hidden="true"></span>
           </div>
         </div>
